@@ -42,301 +42,184 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 _prompt_lock = asyncio.Lock()
 
+ACCOUNT_PUBLIC_SERVICE = "https://account-public-service-prod03.ol.epicgames.com"
+OAUTH_TOKEN = f"{ACCOUNT_PUBLIC_SERVICE}/account/api/oauth/token"
+EXCHANGE = f"{ACCOUNT_PUBLIC_SERVICE}/account/api/oauth/exchange"
+DEVICE_CODE = f"{ACCOUNT_PUBLIC_SERVICE}/account/api/oauth/deviceAuthorization"
+ACCOUNT_BY_USER_ID = f"{ACCOUNT_PUBLIC_SERVICE}/account/api/public/account/" + "{user_id}"
+DEVICE_AUTH_GENERATE = f"{ACCOUNT_PUBLIC_SERVICE}/account/api/public/account/" + "{account_id}/deviceAuth"
 
 class Auth:
-    def __init__(self, **kwargs: Any) -> None:
-        self.ios_token = kwargs.get('ios_token', 'MzQ0NmNkNzI2OTRjNGE0NDg1ZDgxYjc3YWRiYjIxNDE6OTIwOWQ0YTVlMjVhNDU3ZmI5YjA3NDg5ZDMxM2I0MWE=')  # noqa
-        self.fortnite_token = kwargs.get('fortnite_token', 'ZWM2ODRiOGM2ODdmNDc5ZmFkZWEzY2IyYWQ4M2Y1YzY6ZTFmMzFjMjExZjI4NDEzMTg2MjYyZDM3YTEzZmM4NGQ=')  # noqa
+    def __init__(self, bot: 'Bot',
+                 http: HTTPClient,
+                 **kwargs: Any) -> None:
+        self.bot = bot
 
-    def initialize(self, client: 'Client') -> None:
-        self.client = client
-        self.device_id = getattr(self, 'device_id', None) or uuid.uuid4().hex
-        self._refresh_event = asyncio.Event()
-        self._refresh_lock = asyncio.Lock()
-        self.refresh_i = 0
+        fortnitepy_auth = fortnitepy.Auth()
+        self._launcher_token = fortnitepy_auth.ios_token
+        self._fortnite_token = fortnitepy_auth.fortnite_token
+        self._switch_token = kwargs.get('switch_token', 'NTIyOWRjZDNhYzM4NDUyMDhiNDk2NjQ5MDkyZjI1MWI6ZTNiZDJkM2UtYmY4Yy00ODU3LTllN2QtZjNkOTQ3ZDIyMGM3')  # noqa
 
-    @property
-    def ios_authorization(self) -> str:
-        return 'bearer {0}'.format(self.ios_access_token)
+        self.http = http
 
-    @property
-    def authorization(self) -> str:
-        return 'bearer {0}'.format(self.access_token)
+    async def close(self) -> None:
+        await self.http.close()
 
-    @property
-    def identifier(self) -> str:
-        raise NotImplementedError
-
-    def eula_check_needed(self) -> bool:
-        return True
-
-    async def authenticate(self, **kwargs) -> dict:
-        raise NotImplementedError
-
-    async def _authenticate(self, priority: int = 0) -> None:
-        max_attempts = 3
-        for i in range(max_attempts):
-            try:
-                log.info('Running authentication.')
-                return await self.authenticate(priority=priority)
-            except HTTPException as exc:
-                codes = (
-                    ('errors.com.epicgames.account.oauth.'
-                     'exchange_code_not_found'),
-                    ('errors.com.epicgames.account.oauth.'
-                     'expired_exchange_code_session'),
-                )
-                if exc.message_code in codes:
-                    if i != max_attempts-1:
-                        continue
-
-                raise
-            except asyncio.CancelledError:
-                return False
-
-    async def reauthenticate(self, priority: int = 0) -> dict:
-        raise NotImplementedError
-
-    async def get_eula_version(self, **kwargs: Any) -> int:
-        data = await self.client.http.eulatracking_get_data(**kwargs)
-        return data['version'] if isinstance(data, dict) else 0
-
-    async def accept_eula(self, **kwargs: Any) -> None:
-        version = await self.get_eula_version(**kwargs)
-        if version != 0:
-            await self.client.http.eulatracking_accept(
-                version,
-                **kwargs
-            )
-
-            try:
-                await self.client.http.fortnite_grant_access(**kwargs)
-            except HTTPException as e:
-                if e.message_code != 'errors.com.epicgames.bad_request':
-                    raise
-
-    def _update_ios_data(self, data: dict) -> None:
-        self.ios_access_token = data['access_token']
-        self.ios_expires_in = data['expires_in']
-        self.ios_expires_at = self.client.from_iso(data["expires_at"])
-        self.ios_token_type = data['token_type']
-        self.ios_refresh_token = data['refresh_token']
-        self.ios_refresh_expires = data['refresh_expires']
-        self.ios_refresh_expires_at = data['refresh_expires_at']
-        self.ios_account_id = data['account_id']
-        self.ios_client_id = data['client_id']
-        self.ios_internal_client = data['internal_client']
-        self.ios_client_service = data['client_service']
-        self.ios_app = data['app']
-        self.ios_in_app_id = data['in_app_id']
-
-    def _update_data(self, data: dict) -> None:
-        self.access_token = data['access_token']
-        self.expires_in = data['expires_in']
-        self.expires_at = self.client.from_iso(data["expires_at"])
-        self.token_type = data['token_type']
-        self.refresh_token = data['refresh_token']
-        self.refresh_expires = data['refresh_expires']
-        self.refresh_expires_at = data['refresh_expires_at']
-        self.account_id = data['account_id']
-        self.client_id = data['client_id']
-        self.internal_client = data['internal_client']
-        self.client_service = data['client_service']
-        self.app = data['app']
-        self.in_app_id = data['in_app_id']
-
-    async def grant_refresh_token(self, refresh_token: str, auth_token: str, *,
-                                  priority: int = 0) -> dict:
-        payload = {
-            'grant_type': 'refresh_token',
-            'refresh_token': refresh_token
-        }
-
-        return await self.client.http.account_oauth_grant(
-            auth='basic {0}'.format(auth_token),
-            device_id=True,
-            data=payload,
-            priority=priority
+    async def fetch_launcher_access_token(self, payload: dict, launcher_token: Optional[str] = None
+                                          ) -> Tuple[str, str, datetime.datetime, str]:
+        data = await self.http.post(
+            OAUTH_TOKEN,
+            headers={
+                'Authorization': f'basic {launcher_token or self._launcher_token}'
+            },
+            data=payload
+        )
+        return (
+            data['access_token'],
+            data['refresh_token'],
+            fortnitepy.Client.from_iso(data['expires_at']),
+            data['account_id']
         )
 
-    async def get_exchange_code(self, *,
-                                auth='IOS_ACCESS_TOKEN',
-                                priority: int = 0) -> str:
-        data = await self.client.http.account_get_exchange_data(
-            auth=auth,
-            priority=priority
+    async def fetch_client_credentials(self) -> Tuple[str, datetime.datetime]:
+        data = await self.http.post(
+            OAUTH_TOKEN,
+            headers={
+                'Authorization': f'basic {self._switch_token}'
+            },
+            data={
+                'grant_type': 'client_credentials',
+                'token_type': 'eg1'
+            }
+        )
+        return data['access_token'], fortnitepy.Client.from_iso(data['expires_at'])
+
+    async def get_exchange_code(self, access_token: str) -> str:
+        data = await self.http.get(
+            EXCHANGE,
+            headers={
+                'Authorization': f'bearer {access_token}'
+            }
         )
         return data['code']
 
-    async def exchange_code_for_session(self, token: str, code: str, *,
-                                        priority: int = 0) -> dict:
+    async def exchange_code_for_session(self, token: str, code: str) -> dict:
         payload = {
             'grant_type': 'exchange_code',
             'exchange_code': code,
             'token_type': 'eg1',
         }
 
-        return await self.client.http.account_oauth_grant(
-            auth='basic {0}'.format(token),
-            device_id=True,
-            data=payload,
-            priority=priority
+        return await self.http.post(
+            OAUTH_TOKEN,
+            headers={
+                'Authorization': f'basic {token}'
+            },
+            data=payload
         )
 
-    async def kill_token(self, token: str) -> None:
-        await self.client.http.account_sessions_kill_token(
-            token,
-            auth='bearer {0}'.format(token)
+    async def get_device_code(self, access_token: str) -> Tuple[str, str, str]:
+        data = await self.http.post(
+            DEVICE_CODE,
+            headers={
+                'Authorization': f'bearer {access_token}',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            data={
+                'prompt': 'login',
+                'grant_type': 'device_code'
+            }
         )
+        return data['user_code'], data['device_code'], data['verification_uri_complete']
 
-    async def kill_other_sessions(self, auth: str = 'IOS_ACCESS_TOKEN', *,
-                                  priority: int = 0) -> None:
-        await self.client.http.account_sessions_kill(
-            'OTHERS_ACCOUNT_CLIENT_SERVICE',
-            auth=auth,
-            priority=priority
+    async def generate_device_auth(self, account_id: str, access_token: str) -> Tuple[str, str, str]:
+        data = await self.http.post(
+            DEVICE_AUTH_GENERATE.format(account_id=account_id),
+            headers={
+                'Authorization': f'bearer {access_token}',
+                'Content-Type': 'application/json'
+            }
         )
-        log.debug('Killing other sessions')
+        return data['deviceId'], data['accountId'], data['secret']
 
-    def refresh_loop_running(self):
-        task = self.client._refresh_task
-        return task is not None and not task.cancelled()
+    async def account_by_user_id(self, access_token: str, user_id: str):
+        data = await self.http.get(
+            ACCOUNT_BY_USER_ID.format(user_id=user_id),
+            headers={
+                'Authorization': f'bearer {access_token}'
+            }
+        )
+        return data
 
-    async def schedule_token_refresh(self) -> None:
-        subtracted = self.ios_expires_at - datetime.datetime.utcnow()
-        self.token_timeout = (subtracted).total_seconds() - 300
-        await asyncio.sleep(self.token_timeout)
-
-    async def run_refresh_loop(self) -> None:
-        loop = self.client.loop
-
+    async def device_code_auth(self, email: str) -> Tuple[str, str, datetime.datetime, str]:
+        client_expires_at = None
+        client_access_token = None
+        access_token = None
         while True:
-            self._refresh_event.clear()
-            _, p = await asyncio.wait((
-                loop.create_task(self._refresh_event.wait()),
-                loop.create_task(self.schedule_token_refresh())
-            ), return_when=asyncio.FIRST_COMPLETED)
+            if client_expires_at is None or (client_expires_at - datetime.timedelta(minutes=1)) > datetime.datetime.utcnow():
+                client_access_token, client_expires_at = await self.fetch_client_credentials()
+            _, device_code, uri = await self.get_device_code(client_access_token)
 
-            for pending in p:
-                if not pending.cancelled():
-                    pending.cancel()
-
-            await self.do_refresh()
-
-    async def do_refresh(self) -> None:
-        reauth_lock = self.client._reauth_lock
-        reauth_lock.priority += 1
-        forced = reauth_lock.locked()
-
-        try:
-            if not forced:
-                await self._refresh_lock.acquire()
-
-            log.debug('Refreshing session')
-            self.client._refresh_times.append(time.time())
-
-            try:
-                data = await self.grant_refresh_token(
-                    self.ios_refresh_token,
-                    self.ios_token,
-                    priority=reauth_lock.priority
-                )
-                self._update_ios_data(data)
-
-                data = await self.grant_refresh_token(
-                    self.refresh_token,
-                    self.fortnite_token,
-                    priority=reauth_lock.priority
-                )
-                self._update_data(data)
-            except (HTTPException, AttributeError) as exc:
-                m = 'errors.com.epicgames.account.auth_token.' \
-                    'invalid_refresh_token'
-                if isinstance(exc, HTTPException) and exc.message_code != m:
-                    raise
-
-                log.debug(
-                    'Invalid refresh token was supplied. Attempting to '
-                    'reconnect if possible.'
-                )
+            payload = {
+                'grant_type': 'device_code',
+                'device_code': device_code,
+                'token_type': 'eg1'
+            }
+            text = self.bot.l(
+                'confirm_authorization',
+                uri,
+                email
+            )
+            self.bot.web_text = text.get_text()
+            self.bot.send(text)
+            while True:
+                flag = False
                 try:
-                    await self.reauthenticate(
-                        priority=reauth_lock.priority
-                    )
-                except NotImplementedError:
-                    raise exc
+                    access_token, _, _, account_id = await self.fetch_launcher_access_token(payload, self._switch_token)
+                except HTTPException as e:
+                    if e.message_code == 'errors.com.epicgames.not_found':
+                        break
+                    elif e.message_code == 'errors.com.epicgames.account.oauth.authorization_pending':
+                        await asyncio.sleep(5)
+                        continue
+                    raise
+                else:
+                    code = await self.get_exchange_code(access_token)
+                    fortnite_access_token = (await self.exchange_code_auth(code))[0]
+                    user = await self.account_by_user_id(fortnite_access_token, account_id)
+                    if self.bot.cleanup_email(user['email']) == self.bot.cleanup_email(email):
+                        flag = True
+                    else:
+                        self.bot.send(
+                            self.bot.l(
+                                'account_incorrect',
+                                user['email'],
+                                email
+                            )
+                        )
+                    break
+            if flag:
+                break
+        self.bot.web_text = ''
+        code = await self.get_exchange_code(access_token)
+        return await self.exchange_code_auth(code)
 
-                log.debug('Successfully reauthenticated.')
+    async def exchange_code_auth(self, code: str) -> Tuple[str, str, datetime.datetime, str]:
+        payload = {
+            'grant_type': 'exchange_code',
+            'exchange_code': code,
+            'token_type': 'eg1'
+        }
+        return await self.fetch_launcher_access_token(payload)
 
-            try:
-                log.debug('Refreshing xmpp session')
-                await self.client.xmpp.close()
-                await self.client.xmpp.run()
-
-                await self.client._reconnect_to_party()
-            except AttributeError:
-                pass
-
-            self.refresh_i += 1
-            log.debug('Sessions was successfully refreshed.')
-            self.client.dispatch_event('auth_refresh')
-
-        finally:
-            if not forced:
-                self._refresh_lock.release()
-
-    async def run_refresh(self) -> None:
-        self._refresh_event.set()
-        await self.client.wait_for('auth_refresh')
-
-    def refreshing(self) -> bool:
-        return self._refresh_lock.locked()
-
-    async def fetch_device_auths(self) -> List[dict]:
-        # Return payload:
-        # [
-        #     {
-        #         "deviceId": "01fbc14162634294a1db59ddced3c10c",
-        #         "accountId": "4a6313cbbe7d432b8132b5ee67ad53fa",
-        #         "userAgent": "EpicGamesLauncher/++Fortnite+Release-12.00-CL-11586896 Windows/10.0.17134.1.768.64bit",  # noqa
-        #         "created": {
-        #             "location": "Oslo, Norway",
-        #             "ipAddress": "",  # ipv4 address
-        #             "dateTime": "2020-04-25T20:38:57.570Z"
-        #         },
-        #         "lastAccess": {
-        #             "location": "Oslo, Norway",
-        #             "ipAddress": "",  # ipv4 address
-        #             "dateTime": "2020-05-13T16:33:43.075Z"
-        #         }
-        #     }
-        # ]
-        return await self.client.http.account_get_device_auths(
-            self.ios_account_id
-        )
-
-    async def generate_device_auth(self) -> dict:
-        # Return payload:
-        # {
-        #     "deviceId": "e2ba6aa72411468ba4fee016086809d7",
-        #     "accountId": "4a6313cbbe7d432b8132b5ee67ad53fa",
-        #     "secret": "",  # 32 char (not hex)
-        #     "userAgent": "EpicGamesLauncher/++Fortnite+Release-12.00-CL-11586896 Windows/10.0.17134.1.768.64bit",  # noqa
-        #     "created": {
-        #         "location": "Oslo, Norway",
-        #         "ipAddress": "",  # ipv4
-        #         "dateTime": "2020-05-13T18:32:07.601Z"
-        #     }
-        # }
-        return await self.client.http.account_generate_device_auth(
-            self.ios_account_id
-        )
-
-    async def delete_device_auth(self, device_id: str) -> None:
-        await self.client.http.account_delete_device_auth(
-            self.ios_account_id,
-            device_id
-        )
+    async def authenticate(self, email: str) -> dict:
+        access_token, _, _, account_id = await self.device_code_auth(email)
+        device_id, account_id, secret = await self.generate_device_auth(account_id, access_token)
+        return {
+            'device_id': device_id,
+            'account_id': account_id,
+            'secret': secret
+        }
 
 
 class EmailAndPasswordAuth(Auth):

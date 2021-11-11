@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 
-BEN_BOT_BASE = 'http://benbotfn.tk:8080'
+BEN_BOT_BASE = 'https://benbot.app'
 email = 'email@email.com'
 password = 'password1'
 filename = 'device_auths.json'

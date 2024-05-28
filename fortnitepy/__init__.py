@@ -28,7 +28,7 @@ SOFTWARE.
 __version__ = '3.3.5'
 
 from .client import Client, run_multiple, start_multiple, close_multiple
-from .auth import (Auth, EmailAndPasswordAuth, ExchangeCodeAuth,
+from .auth import (Auth, ExchangeCodeAuth,
                    AuthorizationCodeAuth, DeviceAuth, RefreshTokenAuth,
                    AdvancedAuth)
 from .friend import Friend, IncomingPendingFriend, OutgoingPendingFriend
